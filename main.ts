@@ -42,7 +42,7 @@ Deno.serve(async (req) => {
     { ok: false, erro: "Rota não encontrada." },
     { status: 404 },
   );
-});
+
 if (url.pathname === "/teste-preferencia") {
   if (!token) {
     return Response.json(
