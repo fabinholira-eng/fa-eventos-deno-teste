@@ -82,3 +82,4 @@ if (url.pathname === "/teste-preferencia") {
     resposta: texto.slice(0, 1500),
   });
 }
+});
