@@ -43,3 +43,42 @@ Deno.serve(async (req) => {
     { status: 404 },
   );
 });
+if (url.pathname === "/teste-preferencia") {
+  if (!token) {
+    return Response.json(
+      { ok: false, erro: "Token não configurado." },
+      { status: 500 },
+    );
+  }
+
+  const resposta = await fetch(
+    "https://api.mercadopago.com/checkout/preferences",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        items: [
+          {
+            id: "halloween-2026",
+            title: "Halloween 2026 - A Noite das Almas",
+            quantity: 1,
+            currency_id: "BRL",
+            unit_price: 15,
+          },
+        ],
+      }),
+    },
+  );
+
+  const texto = await resposta.text();
+
+  return Response.json({
+    ok: resposta.ok,
+    status: resposta.status,
+    statusText: resposta.statusText,
+    resposta: texto.slice(0, 1500),
+  });
+}
