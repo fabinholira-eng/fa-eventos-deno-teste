@@ -19,7 +19,6 @@ function json(data: unknown, status = 200) {
 Deno.serve(async (req) => {
   const url = new URL(req.url);
 
-  // Responde à verificação CORS feita pelo navegador
   if (req.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -27,7 +26,6 @@ Deno.serve(async (req) => {
     });
   }
 
-  // Rota inicial
   if (url.pathname === "/" && req.method === "GET") {
     return json({
       ok: true,
@@ -35,117 +33,73 @@ Deno.serve(async (req) => {
     });
   }
 
-  // Teste de comunicação com o Mercado Pago
   if (url.pathname === "/teste-token" && req.method === "GET") {
     if (!token) {
-      return json(
-        {
-          ok: false,
-          erro: "Token não configurado.",
-        },
-        500,
-      );
+      return json({ ok: false, erro: "Token não configurado." }, 500);
     }
 
-    try {
-      const resposta = await fetch(
-        "https://api.mercadopago.com/v1/payment_methods",
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Accept: "application/json",
-          },
+    const resposta = await fetch(
+      "https://api.mercadopago.com/v1/payment_methods",
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/json",
         },
-      );
+      },
+    );
 
-      const texto = await resposta.text();
+    const texto = await resposta.text();
 
-      return json({
-        ok: resposta.ok,
-        status: resposta.status,
-        statusText: resposta.statusText,
-        resposta: texto.slice(0, 500),
-      });
-    } catch (erro) {
-      return json(
-        {
-          ok: false,
-          erro: erro instanceof Error ? erro.message : String(erro),
-        },
-        500,
-      );
-    }
+    return json({
+      ok: resposta.ok,
+      status: resposta.status,
+      statusText: resposta.statusText,
+      resposta: texto.slice(0, 500),
+    });
   }
 
-  // Teste mínimo de criação de preferência
-  if (
-    url.pathname === "/teste-preferencia" &&
-    req.method === "GET"
-  ) {
+  if (url.pathname === "/teste-preferencia" && req.method === "GET") {
     if (!token) {
-      return json(
-        {
-          ok: false,
-          erro: "Token não configurado.",
-        },
-        500,
-      );
+      return json({ ok: false, erro: "Token não configurado." }, 500);
     }
 
-    try {
-      const resposta = await fetch(
-        "https://api.mercadopago.com/checkout/preferences",
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-            "cache-control": "no-cache",
-          },
-          body: JSON.stringify({
-            items: [
-              {
-                id: "halloween-2026",
-                title: "Halloween 2026 - A Noite das Almas",
-                quantity: 1,
-                currency_id: "BRL",
-                unit_price: 15,
-              },
-            ],
-          }),
+    const resposta = await fetch(
+      "https://api.mercadopago.com/checkout/preferences",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "cache-control": "no-cache",
         },
-      );
+        body: JSON.stringify({
+          items: [
+            {
+              id: "halloween-2026",
+              title: "Halloween 2026 - A Noite das Almas",
+              quantity: 1,
+              currency_id: "BRL",
+              unit_price: 15,
+            },
+          ],
+        }),
+      },
+    );
 
-      const texto = await resposta.text();
+    const texto = await resposta.text();
 
-      return json({
-        ok: resposta.ok,
-        status: resposta.status,
-        statusText: resposta.statusText,
-        resposta: texto.slice(0, 1500),
-      });
-    } catch (erro) {
-      return json(
-        {
-          ok: false,
-          erro: erro instanceof Error ? erro.message : String(erro),
-        },
-        500,
-      );
-    }
+    return json({
+      ok: resposta.ok,
+      status: resposta.status,
+      statusText: resposta.statusText,
+      resposta: texto.slice(0, 1500),
+    });
   }
 
-  // Rota utilizada pelo aplicativo para iniciar o pagamento
-  if (
-    url.pathname === "/criar-pagamento" &&
-    req.method === "POST"
-  ) {
+  if (url.pathname === "/criar-pagamento" && req.method === "POST") {
     if (!token) {
       return json(
-        {
-          ok: false,
-          erro: "Token do Mercado Pago não configurado.",
-        },
+        { ok: false, erro: "Token do Mercado Pago não configurado." },
         500,
       );
     }
@@ -154,16 +108,11 @@ Deno.serve(async (req) => {
       const body = await req.json();
 
       const comprador =
-        typeof body.comprador === "string"
-          ? body.comprador.trim()
-          : "";
+        typeof body.comprador === "string" ? body.comprador.trim() : "";
 
       if (!comprador) {
         return json(
-          {
-            ok: false,
-            erro: "Nome do comprador é obrigatório.",
-          },
+          { ok: false, erro: "Nome do comprador é obrigatório." },
           400,
         );
       }
@@ -199,9 +148,7 @@ Deno.serve(async (req) => {
             metadata: {
               comprador,
               telefone:
-                typeof body.telefone === "string"
-                  ? body.telefone
-                  : "",
+                typeof body.telefone === "string" ? body.telefone : "",
               vendedor_id:
                 body.vendedorId !== undefined
                   ? String(body.vendedorId)
@@ -211,9 +158,7 @@ Deno.serve(async (req) => {
                   ? body.vendedorNome
                   : "",
               pagamento:
-                typeof body.pagamento === "string"
-                  ? body.pagamento
-                  : "",
+                typeof body.pagamento === "string" ? body.pagamento : "",
             },
           }),
         },
@@ -242,34 +187,18 @@ Deno.serve(async (req) => {
         );
       }
 
-      const preferenceId =
-        typeof dados.id === "string" ? dados.id : "";
-
-      const initPoint =
-        typeof dados.init_point === "string"
-          ? dados.init_point
-          : "";
-
-      const sandboxInitPoint =
-        typeof dados.sandbox_init_point === "string"
-          ? dados.sandbox_init_point
-          : "";
-
-      if (!initPoint) {
-        return json(
-          {
-            ok: false,
-            erro: "Mercado Pago não retornou o endereço do checkout.",
-          },
-          502,
-        );
-      }
-
       return json({
         ok: true,
-        preferenceId,
-        initPoint,
-        sandboxInitPoint,
+        preferenceId:
+          typeof dados.id === "string" ? dados.id : "",
+        initPoint:
+          typeof dados.init_point === "string"
+            ? dados.init_point
+            : "",
+        sandboxInitPoint:
+          typeof dados.sandbox_init_point === "string"
+            ? dados.sandbox_init_point
+            : "",
         externalReference,
       });
     } catch (erro) {
@@ -283,6 +212,82 @@ Deno.serve(async (req) => {
         },
         500,
       );
+    }
+  }
+
+  // Recebe notificações do Mercado Pago
+  if (url.pathname === "/webhook" && req.method === "POST") {
+    if (!token) {
+      return json({ ok: false, erro: "Token não configurado." }, 500);
+    }
+
+    try {
+      let body: Record<string, unknown> = {};
+
+      try {
+        body = await req.json();
+      } catch {
+        body = {};
+      }
+
+      const data =
+        typeof body.data === "object" && body.data !== null
+          ? (body.data as Record<string, unknown>)
+          : {};
+
+      const pagamentoId =
+        String(
+          data.id ??
+          body.id ??
+          url.searchParams.get("data.id") ??
+          url.searchParams.get("id") ??
+          "",
+        ).trim();
+
+      // Mercado Pago precisa receber 200 mesmo quando a notificação
+      // não contém um pagamento utilizável.
+      if (!pagamentoId) {
+        return json({
+          ok: true,
+          mensagem: "Notificação recebida sem ID de pagamento.",
+        });
+      }
+
+      const respostaPagamento = await fetch(
+        `https://api.mercadopago.com/v1/payments/${pagamentoId}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        },
+      );
+
+      if (!respostaPagamento.ok) {
+        return json({
+          ok: true,
+          mensagem: "Notificação recebida. Pagamento ainda não localizado.",
+          pagamentoId,
+        });
+      }
+
+      const pagamento =
+        await respostaPagamento.json() as Record<string, unknown>;
+
+      return json({
+        ok: true,
+        pagamentoId,
+        status: pagamento.status ?? null,
+        externalReference: pagamento.external_reference ?? null,
+        mensagem:
+          pagamento.status === "approved"
+            ? "Pagamento aprovado e confirmado pelo Mercado Pago."
+            : "Pagamento recebido, mas ainda não aprovado.",
+      });
+    } catch {
+      return json({
+        ok: true,
+        mensagem: "Notificação recebida.",
+      });
     }
   }
 
