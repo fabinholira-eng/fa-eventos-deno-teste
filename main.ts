@@ -1,7 +1,8 @@
-const token = Deno.env.get("MERCADO_PAGO_ACCESS_TOKEN");
+import { cert, initializeApp } from "npm:firebase-admin/app";
+import { getFirestore } from "npm:firebase-admin/firestore";
 
-const WEBHOOK_URL =
-  "https://fa-eventos-deno-teste.fa-producoes.deno.net/webhook";
+const token = Deno.env.get("MERCADO_PAGO_ACCESS_TOKEN");
+const firebaseServiceAccount = Deno.env.get("FIREBASE_SERVICE_ACCOUNT");
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -19,10 +20,116 @@ function json(data: unknown, status = 200) {
   });
 }
 
+// -------------------------------------------------------
+// FIREBASE / FIRESTORE
+// -------------------------------------------------------
+
+let db: ReturnType<typeof getFirestore> | null = null;
+
+if (firebaseServiceAccount) {
+  try {
+    const serviceAccount = JSON.parse(firebaseServiceAccount);
+
+    const firebaseApp = initializeApp({
+      credential: cert(serviceAccount),
+      projectId: serviceAccount.project_id,
+    });
+
+    db = getFirestore(firebaseApp);
+  } catch (erro) {
+    console.error("Erro ao iniciar Firebase:", erro);
+  }
+}
+
+// -------------------------------------------------------
+// REGISTRAR VENDA APROVADA
+// -------------------------------------------------------
+
+async function registrarVendaAprovada(
+  pagamentoId: string,
+  pagamento: Record<string, unknown>,
+) {
+  if (!db) {
+    throw new Error("Firestore não inicializado.");
+  }
+
+  const metadata =
+    typeof pagamento.metadata === "object" && pagamento.metadata !== null
+      ? pagamento.metadata as Record<string, unknown>
+      : {};
+
+  const comprador = String(metadata.comprador ?? "").trim();
+  const telefone = String(metadata.telefone ?? "").trim();
+  const pagamentoForma = String(metadata.pagamento ?? "").trim();
+  const vendedorNome = String(metadata.vendedor_nome ?? "").trim();
+
+  const vendedorIdTexto = String(metadata.vendedor_id ?? "").trim();
+  const vendedorId = Number(vendedorIdTexto);
+
+  if (
+    !comprador ||
+    !vendedorNome ||
+    !vendedorIdTexto ||
+    !Number.isFinite(vendedorId)
+  ) {
+    throw new Error("Pagamento aprovado sem dados completos da venda.");
+  }
+
+  // O ID do pagamento do Mercado Pago torna a operação idempotente:
+  // se o webhook for reenviado, a mesma venda será atualizada,
+  // e não será criada uma segunda venda.
+  const id = Number(pagamentoId);
+
+  if (!Number.isFinite(id)) {
+    throw new Error("ID de pagamento inválido.");
+  }
+
+  const referenciaVenda = db.collection("vendas").doc(pagamentoId);
+
+  const vendaExistente = await referenciaVenda.get();
+
+  if (vendaExistente.exists) {
+    return {
+      criada: false,
+      ingresso: vendaExistente.data()?.ingresso ?? pagamentoId,
+    };
+  }
+
+  const ingresso = `FEA-${pagamentoId}`;
+
+  await referenciaVenda.set({
+    id,
+    comprador,
+    telefone,
+    pagamento: pagamentoForma,
+    vendedorId,
+    vendedorNome,
+    ingresso,
+    usado: false,
+    cancelado: false,
+
+    // Dados adicionais de segurança e auditoria
+    mercadoPagoId: pagamentoId,
+    externalReference: String(pagamento.external_reference ?? ""),
+    statusPagamento: "approved",
+    valor: Number(pagamento.transaction_amount ?? 15),
+    comissao: 5,
+    criadoEm: new Date().toISOString(),
+  });
+
+  return {
+    criada: true,
+    ingresso,
+  };
+}
+
+// -------------------------------------------------------
+// SERVIDOR
+// -------------------------------------------------------
+
 Deno.serve(async (req) => {
   const url = new URL(req.url);
 
-  // CORS
   if (req.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -30,72 +137,75 @@ Deno.serve(async (req) => {
     });
   }
 
-  // Rota inicial
+  // -----------------------------------------------------
+  // ROTA PRINCIPAL
+  // -----------------------------------------------------
+
   if (url.pathname === "/" && req.method === "GET") {
     return json({
       ok: true,
       servico: "F&A Eventos API - Deno",
+      firestore: db ? "conectado" : "não conectado",
     });
   }
 
-  // Teste do Access Token
+  // -----------------------------------------------------
+  // TESTE DO TOKEN
+  // -----------------------------------------------------
+
   if (url.pathname === "/teste-token" && req.method === "GET") {
     if (!token) {
-      return json(
-        {
-          ok: false,
-          erro: "Token não configurado.",
-        },
-        500,
-      );
+      return json({
+        ok: false,
+        erro: "MERCADO_PAGO_ACCESS_TOKEN não configurado.",
+      }, 500);
     }
 
     try {
       const resposta = await fetch(
-        "https://api.mercadopago.com/v1/payment_methods",
+        "https://api.mercadopago.com/users/me",
         {
           headers: {
             Authorization: `Bearer ${token}`,
-            Accept: "application/json",
           },
         },
       );
 
       const texto = await resposta.text();
 
+      let dados: unknown = {};
+
+      if (texto.trim()) {
+        try {
+          dados = JSON.parse(texto);
+        } catch {
+          dados = texto;
+        }
+      }
+
       return json({
         ok: resposta.ok,
         status: resposta.status,
-        statusText: resposta.statusText,
-        resposta: texto.slice(0, 500),
+        dados,
       });
     } catch (erro) {
-      return json(
-        {
-          ok: false,
-          erro:
-            erro instanceof Error
-              ? erro.message
-              : "Erro ao consultar Mercado Pago.",
-        },
-        500,
-      );
+      return json({
+        ok: false,
+        erro: erro instanceof Error ? erro.message : String(erro),
+      }, 500);
     }
   }
 
-  // Teste mínimo de criação de preferência
-  if (
-    url.pathname === "/teste-preferencia" &&
-    req.method === "GET"
-  ) {
+  // -----------------------------------------------------
+  // TESTE DE PREFERÊNCIA
+  // -----------------------------------------------------
+
+  if (url.pathname === "/teste-preferencia" && req.method === "GET") {
     if (!token) {
-      return json(
-        {
-          ok: false,
-          erro: "Token não configurado.",
-        },
-        500,
-      );
+      return json({
+        ok: false,
+        erro: "MERCADO_PAGO_ACCESS_TOKEN não configurado.",
+      }, 500);
     }
 
     try {
@@ -108,58 +218,55 @@ Deno.serve(async (req) => {
             "Content-Type": "application/json",
             "cache-control": "no-cache",
           },
-
           body: JSON.stringify({
             items: [
               {
-                id: "halloween-2026",
-                title: "Halloween 2026 - A Noite das Almas",
+                id: "teste-fea",
+                title: "Teste F&A Eventos",
                 quantity: 1,
                 currency_id: "BRL",
                 unit_price: 15,
               },
             ],
-
-            notification_url: WEBHOOK_URL,
           }),
         },
       );
 
       const texto = await resposta.text();
 
+      let dados: unknown = {};
+
+      if (texto.trim()) {
+        try {
+          dados = JSON.parse(texto);
+        } catch {
+          dados = texto;
+        }
+      }
+
       return json({
         ok: resposta.ok,
         status: resposta.status,
-        statusText: resposta.statusText,
-        resposta: texto.slice(0, 1500),
+        dados,
       });
     } catch (erro) {
-      return json(
-        {
-          ok: false,
-          erro:
-            erro instanceof Error
-              ? erro.message
-              : "Erro ao criar preferência de teste.",
-        },
-        500,
-      );
+      return json({
+        ok: false,
+        erro: erro instanceof Error ? erro.message : String(erro),
+      }, 500);
     }
   }
 
-  // Criação do pagamento usada pelo aplicativo
-  if (
-    url.pathname === "/criar-pagamento" &&
-    req.method === "POST"
-  ) {
+  // -----------------------------------------------------
+  // CRIAR PAGAMENTO
+  // -----------------------------------------------------
+
+  if (url.pathname === "/criar-pagamento" && req.method === "POST") {
     if (!token) {
-      return json(
-        {
-          ok: false,
-          erro: "Token do Mercado Pago não configurado.",
-        },
-        500,
-      );
+      return json({
+        ok: false,
+        erro: "MERCADO_PAGO_ACCESS_TOKEN não configurado.",
+      }, 500);
     }
 
     try {
@@ -171,13 +278,10 @@ Deno.serve(async (req) => {
           : "";
 
       if (!comprador) {
-        return json(
-          {
-            ok: false,
-            erro: "Nome do comprador é obrigatório.",
-          },
-          400,
-        );
+        return json({
+          ok: false,
+          erro: "Nome do comprador é obrigatório.",
+        }, 400);
       }
 
       const externalReference = crypto.randomUUID();
@@ -186,13 +290,11 @@ Deno.serve(async (req) => {
         "https://api.mercadopago.com/checkout/preferences",
         {
           method: "POST",
-
           headers: {
             Authorization: `Bearer ${token}`,
             "Content-Type": "application/json",
             "cache-control": "no-cache",
           },
-
           body: JSON.stringify({
             items: [
               {
@@ -210,16 +312,14 @@ Deno.serve(async (req) => {
 
             external_reference: externalReference,
 
-            // Cada pagamento já recebe explicitamente
-            // a URL correta do webhook do Deno.
-            notification_url: WEBHOOK_URL,
+            notification_url:
+              "https://fa-eventos-deno-teste.fa-producoes.deno.net/webhook",
 
             metadata: {
               comprador,
-
               telefone:
                 typeof body.telefone === "string"
-                  ? body.telefone.trim()
+                  ? body.telefone
                   : "",
 
               vendedor_id:
@@ -247,105 +347,166 @@ Deno.serve(async (req) => {
 
       if (texto.trim()) {
         try {
-          dados = JSON.parse(texto) as Record<string, unknown>;
+          dados = JSON.parse(texto);
         } catch {
           dados = {};
         }
       }
 
       if (!resposta.ok) {
-        console.log(
-          "Mercado Pago recusou preferência:",
-          resposta.status,
-          texto,
-        );
-
-        return json(
-          {
-            ok: false,
-            erro: "Mercado Pago recusou a criação do pagamento.",
-            statusMercadoPago: resposta.status,
-          },
-          502,
-        );
-      }
-
-      const preferenceId =
-        typeof dados.id === "string"
-          ? dados.id
-          : "";
-
-      const initPoint =
-        typeof dados.init_point === "string"
-          ? dados.init_point
-          : "";
-
-      const sandboxInitPoint =
-        typeof dados.sandbox_init_point === "string"
-          ? dados.sandbox_init_point
-          : "";
-
-      if (!initPoint) {
-        return json(
-          {
-            ok: false,
-            erro:
-              "Mercado Pago não retornou o endereço do checkout.",
-          },
-          502,
-        );
+        return json({
+          ok: false,
+          erro: "Mercado Pago recusou a criação da preferência.",
+          statusMercadoPago: resposta.status,
+          detalhes: dados,
+        }, 502);
       }
 
       return json({
         ok: true,
-        preferenceId,
-        initPoint,
-        sandboxInitPoint,
+        preferenceId: dados.id ?? null,
+        initPoint: dados.init_point ?? null,
+        sandboxInitPoint: dados.sandbox_init_point ?? null,
         externalReference,
       });
     } catch (erro) {
-      console.log("Erro em /criar-pagamento:", erro);
-
-      return json(
-        {
-          ok: false,
-          erro:
-            erro instanceof Error
-              ? erro.message
-              : "Erro interno ao criar pagamento.",
-        },
-        500,
-      );
+      return json({
+        ok: false,
+        erro: erro instanceof Error ? erro.message : String(erro),
+      }, 500);
     }
   }
 
-  // Consulta manual de um pagamento.
-  // Será útil para testes e para o retorno do aplicativo.
+  // -----------------------------------------------------
+  // WEBHOOK MERCADO PAGO
+  // -----------------------------------------------------
+
+  if (url.pathname === "/webhook" && req.method === "POST") {
+    if (!token) {
+      return json({
+        ok: false,
+        erro: "MERCADO_PAGO_ACCESS_TOKEN não configurado.",
+      }, 500);
+    }
+
+    try {
+      let body: Record<string, unknown> = {};
+
+      try {
+        body = await req.json();
+      } catch {
+        body = {};
+      }
+
+      const data =
+        typeof body.data === "object" && body.data !== null
+          ? body.data as Record<string, unknown>
+          : {};
+
+      const pagamentoId = String(
+        data.id ??
+          body.id ??
+          url.searchParams.get("data.id") ??
+          url.searchParams.get("id") ??
+          "",
+      ).trim();
+
+      if (!pagamentoId) {
+        return json({
+          ok: true,
+          mensagem: "Notificação recebida sem ID de pagamento.",
+        });
+      }
+
+      // Nunca confiamos apenas no conteúdo do webhook.
+      // Consultamos o pagamento diretamente no Mercado Pago.
+      const respostaPagamento = await fetch(
+        `https://api.mercadopago.com/v1/payments/${pagamentoId}`,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        },
+      );
+
+      if (!respostaPagamento.ok) {
+        return json({
+          ok: true,
+          mensagem:
+            "Notificação recebida. Pagamento ainda não localizado.",
+          pagamentoId,
+        });
+      }
+
+      const pagamento =
+        await respostaPagamento.json() as Record<string, unknown>;
+
+      if (pagamento.status !== "approved") {
+        return json({
+          ok: true,
+          pagamentoId,
+          status: pagamento.status ?? null,
+          mensagem:
+            "Pagamento recebido, mas ainda não aprovado.",
+        });
+      }
+
+      // Somente aqui uma venda passa a existir.
+      const resultadoVenda = await registrarVendaAprovada(
+        pagamentoId,
+        pagamento,
+      );
+
+      return json({
+        ok: true,
+        pagamentoId,
+        status: "approved",
+        externalReference:
+          pagamento.external_reference ?? null,
+        vendaRegistrada: resultadoVenda.criada,
+        ingresso: resultadoVenda.ingresso,
+        mensagem: resultadoVenda.criada
+          ? "Pagamento aprovado. Venda registrada no Firestore."
+          : "Pagamento aprovado. A venda já estava registrada.",
+      });
+    } catch (erro) {
+      console.error("Erro no webhook:", erro);
+
+      // Aqui devolvemos erro para que uma falha real de gravação
+      // não seja silenciosamente considerada concluída.
+      return json({
+        ok: false,
+        erro:
+          erro instanceof Error
+            ? erro.message
+            : String(erro),
+      }, 500);
+    }
+  }
+
+  // -----------------------------------------------------
+  // CONSULTAR PAGAMENTO
+  // -----------------------------------------------------
+
   if (
     url.pathname.startsWith("/status-pagamento/") &&
     req.method === "GET"
   ) {
     if (!token) {
-      return json(
-        {
-          ok: false,
-          erro: "Token não configurado.",
-        },
-        500,
-      );
+      return json({
+        ok: false,
+        erro: "MERCADO_PAGO_ACCESS_TOKEN não configurado.",
+      }, 500);
     }
 
     const pagamentoId =
-      url.pathname.replace("/status-pagamento/", "").trim();
+      url.pathname.split("/").pop()?.trim() ?? "";
 
     if (!pagamentoId) {
-      return json(
-        {
-          ok: false,
-          erro: "ID do pagamento não informado.",
-        },
-        400,
-      );
+      return json({
+        ok: false,
+        erro: "ID do pagamento não informado.",
+      }, 400);
     }
 
     try {
@@ -360,254 +521,45 @@ Deno.serve(async (req) => {
 
       const texto = await resposta.text();
 
-      let pagamento: Record<string, unknown> = {};
+      let dados: Record<string, unknown> = {};
 
       if (texto.trim()) {
         try {
-          pagamento =
-            JSON.parse(texto) as Record<string, unknown>;
+          dados = JSON.parse(texto);
         } catch {
-          pagamento = {};
+          dados = {};
         }
       }
 
       if (!resposta.ok) {
-        return json(
-          {
-            ok: false,
-            erro: "Pagamento não localizado.",
-            statusMercadoPago: resposta.status,
-          },
-          resposta.status === 404 ? 404 : 502,
-        );
-      }
-
-      return json({
-        ok: true,
-        pagamentoId,
-        status: pagamento.status ?? null,
-        externalReference:
-          pagamento.external_reference ?? null,
-        metadata:
-          pagamento.metadata ?? null,
-      });
-    } catch (erro) {
-      return json(
-        {
+        return json({
           ok: false,
-          erro:
-            erro instanceof Error
-              ? erro.message
-              : "Erro ao consultar pagamento.",
-        },
-        500,
-      );
-    }
-  }
-
-  // Webhook do Mercado Pago
-  if (
-    url.pathname === "/webhook" &&
-    req.method === "POST"
-  ) {
-    /*
-      IMPORTANTE:
-
-      O webhook NÃO considera o pagamento aprovado apenas
-      porque recebeu uma notificação.
-
-      O ID recebido é usado para consultar diretamente
-      a API oficial do Mercado Pago.
-    */
-
-    try {
-      let body: Record<string, unknown> = {};
-
-      try {
-        body =
-          await req.json() as Record<string, unknown>;
-      } catch {
-        body = {};
-      }
-
-      console.log(
-        "WEBHOOK RECEBIDO:",
-        JSON.stringify(body),
-      );
-
-      const data =
-        typeof body.data === "object" &&
-        body.data !== null
-          ? body.data as Record<string, unknown>
-          : {};
-
-      const pagamentoId = String(
-        data.id ??
-          body.id ??
-          url.searchParams.get("data.id") ??
-          url.searchParams.get("id") ??
-          "",
-      ).trim();
-
-      /*
-        O Mercado Pago espera uma resposta rápida.
-        Se não houver ID utilizável, confirmamos o recebimento
-        sem registrar pagamento.
-      */
-      if (!pagamentoId) {
-        return json({
-          ok: true,
-          mensagem:
-            "Notificação recebida sem ID de pagamento.",
-        });
-      }
-
-      if (!token) {
-        /*
-          Não devolvemos 401 ao Mercado Pago.
-          Registramos o problema no servidor e confirmamos
-          o recebimento da notificação.
-        */
-        console.log(
-          "Webhook recebeu notificação, mas o token não está configurado.",
-        );
-
-        return json({
-          ok: true,
-          mensagem:
-            "Notificação recebida. Verificação pendente.",
-        });
-      }
-
-      /*
-        Agora verificamos o pagamento diretamente
-        no Mercado Pago.
-      */
-      const respostaPagamento = await fetch(
-        `https://api.mercadopago.com/v1/payments/${pagamentoId}`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        },
-      );
-
-      const textoPagamento =
-        await respostaPagamento.text();
-
-      console.log(
-        "CONSULTA PAGAMENTO:",
-        pagamentoId,
-        respostaPagamento.status,
-        textoPagamento.slice(0, 1000),
-      );
-
-      /*
-        Mesmo se o Mercado Pago ainda não disponibilizar
-        imediatamente o pagamento para consulta,
-        confirmamos que o webhook foi recebido.
-      */
-      if (!respostaPagamento.ok) {
-        return json({
-          ok: true,
-          pagamentoId,
-          mensagem:
-            "Notificação recebida. Pagamento ainda não localizado para verificação.",
-          statusConsulta: respostaPagamento.status,
-        });
-      }
-
-      let pagamento: Record<string, unknown> = {};
-
-      if (textoPagamento.trim()) {
-        try {
-          pagamento =
-            JSON.parse(
-              textoPagamento,
-            ) as Record<string, unknown>;
-        } catch {
-          pagamento = {};
-        }
-      }
-
-      const status =
-        typeof pagamento.status === "string"
-          ? pagamento.status
-          : "";
-
-      const externalReference =
-        typeof pagamento.external_reference === "string"
-          ? pagamento.external_reference
-          : "";
-
-      const metadata =
-        typeof pagamento.metadata === "object" &&
-        pagamento.metadata !== null
-          ? pagamento.metadata as Record<string, unknown>
-          : {};
-
-      if (status === "approved") {
-        /*
-          AQUI está a confirmação confiável.
-
-          No próximo passo conectaremos esta confirmação
-          ao Firebase para:
-
-          1. registrar o ingresso como pago;
-          2. impedir duplicidade;
-          3. atribuir os R$ 5 de comissão ao vendedor;
-          4. emitir/ativar o ingresso.
-        */
-
-        console.log(
-          "PAGAMENTO APROVADO:",
-          pagamentoId,
-          externalReference,
-          metadata,
-        );
-
-        return json({
-          ok: true,
-          confirmado: true,
-          pagamentoId,
-          status,
-          externalReference,
-          metadata,
-          mensagem:
-            "Pagamento aprovado e confirmado pelo Mercado Pago.",
-        });
+          erro: "Não foi possível consultar o pagamento.",
+          statusMercadoPago: resposta.status,
+        }, resposta.status === 404 ? 404 : 502);
       }
 
       return json({
         ok: true,
-        confirmado: false,
         pagamentoId,
-        status,
-        externalReference,
-        mensagem:
-          "Pagamento recebido, mas ainda não aprovado.",
+        status: dados.status ?? null,
+        externalReference:
+          dados.external_reference ?? null,
+        metadata: dados.metadata ?? {},
       });
     } catch (erro) {
-      /*
-        O webhook não deve devolver erro de autenticação
-        ao Mercado Pago por falha interna de processamento.
-      */
-      console.log("ERRO NO WEBHOOK:", erro);
-
       return json({
-        ok: true,
-        confirmado: false,
-        mensagem:
-          "Notificação recebida. O processamento será verificado.",
-      });
+        ok: false,
+        erro:
+          erro instanceof Error
+            ? erro.message
+            : String(erro),
+      }, 500);
     }
   }
 
-  return json(
-    {
-      ok: false,
-      erro: "Rota não encontrada.",
-    },
-    404,
-  );
+  return json({
+    ok: false,
+    erro: "Rota não encontrada.",
+  }, 404);
 });
