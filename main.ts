@@ -513,9 +513,6 @@ async function registrarVendaAprovada(
   const telefone =
     String(metadata.telefone ?? "").trim();
 
-  const pagamentoForma =
-    String(metadata.pagamento ?? "").trim();
-
   const vendedorNome =
     String(metadata.vendedor_nome ?? "").trim();
 
@@ -529,6 +526,36 @@ async function registrarVendaAprovada(
     String(
       pagamento.external_reference ?? "",
     ).trim();
+
+  const paymentMethodId =
+    String(
+      pagamento.payment_method_id ?? "",
+    ).trim();
+
+  const paymentTypeId =
+    String(
+      pagamento.payment_type_id ?? "",
+    ).trim();
+
+  let pagamentoForma = "Mercado Pago";
+
+  if (paymentMethodId === "pix") {
+    pagamentoForma = "PIX";
+  } else if (paymentTypeId === "credit_card") {
+    pagamentoForma = "Cartão de crédito";
+  } else if (paymentTypeId === "debit_card") {
+    pagamentoForma = "Cartão de débito";
+  } else if (paymentTypeId === "ticket") {
+    pagamentoForma = "Boleto";
+  } else if (paymentTypeId === "account_money") {
+    pagamentoForma = "Saldo Mercado Pago";
+  } else if (paymentTypeId === "bank_transfer") {
+    pagamentoForma = "Transferência bancária";
+  } else if (paymentMethodId) {
+    pagamentoForma = paymentMethodId;
+  } else if (paymentTypeId) {
+    pagamentoForma = paymentTypeId;
+  }
 
   if (
     !comprador ||
@@ -642,6 +669,9 @@ async function registrarVendaAprovada(
         statusPagamento: "approved",
         mercadoPagoId: pagamentoId,
         ingresso,
+        pagamento: pagamentoForma,
+        paymentMethodId,
+        paymentTypeId,
         atualizadoEm: new Date().toISOString(),
       });
 
@@ -650,6 +680,8 @@ async function registrarVendaAprovada(
         comprador,
         telefone,
         pagamento: pagamentoForma,
+        paymentMethodId,
+        paymentTypeId,
         vendedorId,
         vendedorNome,
         ingresso,
@@ -693,7 +725,6 @@ Deno.serve(async (req) => {
     });
   }
 
-  // CRIAR PAGAMENTO
   if (
     req.method === "POST" &&
     url.pathname === "/criar-pagamento"
@@ -934,7 +965,6 @@ Deno.serve(async (req) => {
     }
   }
 
-  // WEBHOOK DO MERCADO PAGO
   if (
     req.method === "POST" &&
     url.pathname === "/webhook"
@@ -998,9 +1028,6 @@ Deno.serve(async (req) => {
         },
       );
 
-      // IDs fictícios enviados pelo simulador do Mercado Pago
-      // podem não existir na API de pagamentos.
-      // Nesse caso, reconhecemos a notificação e a ignoramos.
       if (
         respostaPagamento.status === 400 ||
         respostaPagamento.status === 404
@@ -1018,8 +1045,6 @@ Deno.serve(async (req) => {
         });
       }
 
-      // Outros erros não devem ser ignorados,
-      // pois podem indicar indisponibilidade ou problema de credencial.
       if (!respostaPagamento.ok) {
         console.error(
           "Não foi possível consultar o pagamento:",
