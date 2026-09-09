@@ -7,7 +7,7 @@ const firebaseServiceAccount = Deno.env.get("FIREBASE_SERVICE_ACCOUNT");
 const webhookSecret = Deno.env.get("MERCADO_PAGO_WEBHOOK_SECRET");
 
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": "https://fea-eventos.web.app",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
