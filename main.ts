@@ -1,5 +1,6 @@
 import { cert, initializeApp } from "npm:firebase-admin/app";
 import { getFirestore } from "npm:firebase-admin/firestore";
+import { getAuth } from "npm:firebase-admin/auth";
 
 const token = Deno.env.get("MERCADO_PAGO_ACCESS_TOKEN");
 const firebaseServiceAccount = Deno.env.get("FIREBASE_SERVICE_ACCOUNT");
@@ -22,6 +23,7 @@ function json(data: unknown, status = 200) {
 }
 
 let db: ReturnType<typeof getFirestore> | null = null;
+let firebaseAuth: ReturnType<typeof getAuth> | null = null;
 
 if (firebaseServiceAccount) {
   try {
@@ -33,8 +35,35 @@ if (firebaseServiceAccount) {
     });
 
     db = getFirestore(firebaseApp);
+    firebaseAuth = getAuth(firebaseApp);
   } catch (erro) {
     console.error("Erro ao iniciar Firebase:", erro);
+  }
+}
+
+async function validarUsuarioFirebase(req: Request) {
+  if (!firebaseAuth) {
+    throw new Error("Firebase Auth não inicializado.");
+  }
+
+  const authorization = req.headers.get("Authorization");
+
+  if (!authorization || !authorization.startsWith("Bearer ")) {
+    return null;
+  }
+
+  const idToken = authorization.substring(7).trim();
+
+  if (!idToken) {
+    return null;
+  }
+
+  try {
+    const usuario = await firebaseAuth.verifyIdToken(idToken);
+    return usuario;
+  } catch (erro) {
+    console.warn("Token Firebase inválido:", erro);
+    return null;
   }
 }
 
@@ -272,6 +301,7 @@ Deno.serve(async (req) => {
       ok: true,
       servico: "F&A Eventos API - Deno",
       firestore: db ? "conectado" : "não conectado",
+      autenticacao: firebaseAuth ? "conectada" : "não conectada",
     });
   }
 
@@ -354,6 +384,16 @@ Deno.serve(async (req) => {
         }, 500);
       }
 
+      const usuarioAutenticado =
+        await validarUsuarioFirebase(req);
+
+      if (!usuarioAutenticado) {
+        return json({
+          erro:
+            "Usuário não autenticado ou sessão inválida.",
+        }, 401);
+      }
+
       const corpo = await req.json();
 
       const comprador =
@@ -419,6 +459,7 @@ Deno.serve(async (req) => {
               vendedor_id: String(vendedorId),
               vendedor_nome: vendedorNome,
               pagamento,
+              usuario_uid: usuarioAutenticado.uid,
             },
           }),
         },
