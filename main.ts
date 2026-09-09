@@ -59,8 +59,7 @@ async function validarUsuarioFirebase(req: Request) {
   }
 
   try {
-    const usuario = await firebaseAuth.verifyIdToken(idToken);
-    return usuario;
+    return await firebaseAuth.verifyIdToken(idToken);
   } catch (erro) {
     console.warn("Token Firebase inválido:", erro);
     return null;
@@ -120,12 +119,10 @@ async function validarAssinaturaWebhook(req: Request) {
     return false;
   }
 
-  const partes = assinaturaHeader.split(",");
-
   let ts = "";
   let v1 = "";
 
-  for (const parte of partes) {
+  for (const parte of assinaturaHeader.split(",")) {
     const [chave, valor] = parte.trim().split("=");
 
     if (chave === "ts") ts = valor ?? "";
@@ -206,84 +203,80 @@ async function registrarVendaAprovada(
   const referenciaContador =
     db.collection("config").doc("contadorIngressos");
 
-  const resultado = await db.runTransaction(
-    async (transaction) => {
-      const vendaExistente =
-        await transaction.get(referenciaVenda);
+  return await db.runTransaction(async (transaction) => {
+    const vendaExistente =
+      await transaction.get(referenciaVenda);
 
-      if (vendaExistente.exists) {
-        return {
-          criada: false,
-          ingresso: String(
-            vendaExistente.data()?.ingresso ?? pagamentoId,
-          ),
-        };
-      }
-
-      const contadorSnapshot =
-        await transaction.get(referenciaContador);
-
-      if (!contadorSnapshot.exists) {
-        throw new Error(
-          "Contador de ingressos não encontrado.",
-        );
-      }
-
-      const ultimoNumero = Number(
-        contadorSnapshot.data()?.ultimoNumero ?? 0,
-      );
-
-      if (!Number.isFinite(ultimoNumero)) {
-        throw new Error(
-          "Contador de ingressos inválido.",
-        );
-      }
-
-      const proximoNumero = ultimoNumero + 1;
-
-      if (proximoNumero > 500) {
-        throw new Error(
-          "Todos os 500 ingressos já foram vendidos.",
-        );
-      }
-
-      const ingresso =
-        `F&A-${String(proximoNumero).padStart(4, "0")}`;
-
-      transaction.update(referenciaContador, {
-        ultimoNumero: proximoNumero,
-      });
-
-      transaction.set(referenciaVenda, {
-        id,
-        comprador,
-        telefone,
-        pagamento: pagamentoForma,
-        vendedorId,
-        vendedorNome,
-        ingresso,
-        usado: false,
-        cancelado: false,
-        mercadoPagoId: pagamentoId,
-        externalReference: String(
-          pagamento.external_reference ?? "",
-        ),
-        statusPagamento: "approved",
-        valor: Number(
-          pagamento.transaction_amount ?? 15,
-        ),
-        comissao: 5,
-        criadoEm: new Date().toISOString(),
-      });
-
+    if (vendaExistente.exists) {
       return {
-        criada: true,
-        ingresso,
+        criada: false,
+        ingresso: String(
+          vendaExistente.data()?.ingresso ?? pagamentoId,
+        ),
       };
-    },
-  );
+    }
 
-  return resultado;
+    const contadorSnapshot =
+      await transaction.get(referenciaContador);
+
+    if (!contadorSnapshot.exists) {
+      throw new Error(
+        "Contador de ingressos não encontrado.",
+      );
+    }
+
+    const ultimoNumero = Number(
+      contadorSnapshot.data()?.ultimoNumero ?? 0,
+    );
+
+    if (!Number.isFinite(ultimoNumero)) {
+      throw new Error(
+        "Contador de ingressos inválido.",
+      );
+    }
+
+    const proximoNumero = ultimoNumero + 1;
+
+    if (proximoNumero > 500) {
+      throw new Error(
+        "Todos os 500 ingressos já foram vendidos.",
+      );
+    }
+
+    const ingresso =
+      `F&A-${String(proximoNumero).padStart(4, "0")}`;
+
+    transaction.update(referenciaContador, {
+      ultimoNumero: proximoNumero,
+    });
+
+    transaction.set(referenciaVenda, {
+      id,
+      comprador,
+      telefone,
+      pagamento: pagamentoForma,
+      vendedorId,
+      vendedorNome,
+      ingresso,
+      usado: false,
+      cancelado: false,
+      mercadoPagoId: pagamentoId,
+      externalReference: String(
+        pagamento.external_reference ?? "",
+      ),
+      statusPagamento: "approved",
+      valor: Number(
+        pagamento.transaction_amount ?? 15,
+      ),
+      comissao: 5,
+      criadoEm: new Date().toISOString(),
+    });
+
+    return {
+      criada: true,
+      ingresso,
+    };
+  });
 }
 
 Deno.serve(async (req) => {
@@ -296,83 +289,15 @@ Deno.serve(async (req) => {
 
   const url = new URL(req.url);
 
+  // Rota mínima apenas para confirmar que o serviço está ativo
   if (req.method === "GET" && url.pathname === "/") {
     return json({
       ok: true,
-      servico: "F&A Eventos API - Deno",
-      firestore: db ? "conectado" : "não conectado",
-      autenticacao: firebaseAuth ? "conectada" : "não conectada",
+      servico: "F&A Eventos API",
     });
   }
 
-  if (
-    req.method === "GET" &&
-    url.pathname === "/teste-token"
-  ) {
-    if (!token) {
-      return json({
-        ok: false,
-        erro: "Token do Mercado Pago não configurado.",
-      }, 500);
-    }
-
-    const resposta = await fetch(
-      "https://api.mercadopago.com/users/me",
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      },
-    );
-
-    const dados = await resposta.json();
-
-    return json({
-      status: resposta.status,
-      dados,
-    });
-  }
-
-  if (
-    req.method === "GET" &&
-    url.pathname === "/teste-preferencia"
-  ) {
-    if (!token) {
-      return json({
-        ok: false,
-        erro: "Token do Mercado Pago não configurado.",
-      }, 500);
-    }
-
-    const resposta = await fetch(
-      "https://api.mercadopago.com/checkout/preferences",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          items: [
-            {
-              title: "Ingresso F&A Eventos",
-              quantity: 1,
-              unit_price: 15,
-              currency_id: "BRL",
-            },
-          ],
-        }),
-      },
-    );
-
-    const dados = await resposta.json();
-
-    return json({
-      status: resposta.status,
-      dados,
-    });
-  }
-
+  // CRIAR PAGAMENTO
   if (
     req.method === "POST" &&
     url.pathname === "/criar-pagamento"
@@ -380,7 +305,7 @@ Deno.serve(async (req) => {
     try {
       if (!token) {
         return json({
-          erro: "Token do Mercado Pago não configurado.",
+          erro: "Serviço de pagamento não configurado.",
         }, 500);
       }
 
@@ -475,15 +400,13 @@ Deno.serve(async (req) => {
         );
 
         return json({
-          erro: "Erro ao criar pagamento.",
-          detalhe: dados,
-        }, resposta.status);
+          erro: "Não foi possível criar o pagamento.",
+        }, 502);
       }
 
       return json({
         preferenceId: dados.id,
         initPoint: dados.init_point,
-        sandboxInitPoint: dados.sandbox_init_point,
         externalReference,
       });
     } catch (erro) {
@@ -498,6 +421,7 @@ Deno.serve(async (req) => {
     }
   }
 
+  // WEBHOOK DO MERCADO PAGO
   if (
     req.method === "POST" &&
     url.pathname === "/webhook"
@@ -518,7 +442,7 @@ Deno.serve(async (req) => {
 
       if (!token) {
         return json({
-          erro: "Token do Mercado Pago não configurado.",
+          erro: "Serviço de pagamento não configurado.",
         }, 500);
       }
 
@@ -544,8 +468,6 @@ Deno.serve(async (req) => {
       if (!pagamentoId) {
         return json({
           recebido: true,
-          mensagem:
-            "Notificação sem ID de pagamento.",
         });
       }
 
@@ -559,13 +481,9 @@ Deno.serve(async (req) => {
       );
 
       if (!respostaPagamento.ok) {
-        const detalhe =
-          await respostaPagamento.text();
-
         console.error(
-          "Erro ao consultar pagamento:",
+          "Não foi possível consultar o pagamento:",
           respostaPagamento.status,
-          detalhe,
         );
 
         return json({
@@ -582,8 +500,6 @@ Deno.serve(async (req) => {
           recebido: true,
           pagamentoId,
           status: pagamento.status,
-          mensagem:
-            "Pagamento ainda não aprovado.",
         });
       }
 
@@ -601,72 +517,14 @@ Deno.serve(async (req) => {
         ingresso: venda.ingresso,
       });
     } catch (erro) {
-      console.error("Erro no webhook:", erro);
-
-      return json({
-        erro:
-          "Erro interno ao processar webhook.",
-      }, 500);
-    }
-  }
-
-  if (
-    req.method === "GET" &&
-    url.pathname.startsWith(
-      "/status-pagamento/",
-    )
-  ) {
-    try {
-      if (!token) {
-        return json({
-          erro: "Token do Mercado Pago não configurado.",
-        }, 500);
-      }
-
-      const pagamentoId =
-        url.pathname.split("/").pop();
-
-      if (!pagamentoId) {
-        return json({
-          erro: "ID de pagamento não informado.",
-        }, 400);
-      }
-
-      const resposta = await fetch(
-        `https://api.mercadopago.com/v1/payments/${pagamentoId}`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        },
-      );
-
-      const pagamento = await resposta.json();
-
-      if (!resposta.ok) {
-        return json({
-          erro:
-            "Não foi possível consultar o pagamento.",
-          detalhe: pagamento,
-        }, resposta.status);
-      }
-
-      return json({
-        id: pagamento.id,
-        status: pagamento.status,
-        externalReference:
-          pagamento.external_reference,
-        metadata: pagamento.metadata,
-      });
-    } catch (erro) {
       console.error(
-        "Erro ao consultar pagamento:",
+        "Erro no webhook:",
         erro,
       );
 
       return json({
         erro:
-          "Erro interno ao consultar pagamento.",
+          "Erro interno ao processar webhook.",
       }, 500);
     }
   }
