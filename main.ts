@@ -289,7 +289,6 @@ Deno.serve(async (req) => {
 
   const url = new URL(req.url);
 
-  // Rota mínima apenas para confirmar que o serviço está ativo
   if (req.method === "GET" && url.pathname === "/") {
     return json({
       ok: true,
@@ -377,6 +376,17 @@ Deno.serve(async (req) => {
 
             notification_url:
               "https://fa-eventos-deno-teste.fa-producoes.deno.net/webhook",
+
+            back_urls: {
+              success:
+                "https://fea-eventos.web.app/?pagamento=sucesso",
+              failure:
+                "https://fea-eventos.web.app/?pagamento=falha",
+              pending:
+                "https://fea-eventos.web.app/?pagamento=pendente",
+            },
+
+            auto_return: "approved",
 
             metadata: {
               comprador,
