@@ -246,19 +246,26 @@ async function limparReservasExpiradas() {
     throw new Error("Firestore não inicializado.");
   }
 
-  const agora = new Date().toISOString();
+  const agoraMs = Date.now();
 
-  const expiradas =
+  // Consulta somente por status para não depender de índice composto.
+  // A comparação da expiração é feita no servidor.
+  const aguardando =
     await db
       .collection("pedidosPagamento")
       .where("status", "==", "aguardando")
-      .where("expiraEm", "<=", agora)
-      .limit(50)
+      .limit(LIMITE_INGRESSOS)
       .get();
 
-  for (const documento of expiradas.docs) {
-    const pedidoRef = documento.ref;
+  for (const documento of aguardando.docs) {
+    const dados = documento.data() ?? {};
+    const expiraEmMs = Date.parse(String(dados.expiraEm ?? ""));
 
+    if (!Number.isFinite(expiraEmMs) || expiraEmMs > agoraMs) {
+      continue;
+    }
+
+    const pedidoRef = documento.ref;
     const contadorRef =
       db.collection("config").doc("contadorIngressos");
 
@@ -275,6 +282,16 @@ async function limparReservasExpiradas() {
         const pedido = pedidoSnapshot.data() ?? {};
 
         if (pedido.status !== "aguardando") {
+          return;
+        }
+
+        const expiraAtualMs =
+          Date.parse(String(pedido.expiraEm ?? ""));
+
+        if (
+          !Number.isFinite(expiraAtualMs) ||
+          expiraAtualMs > Date.now()
+        ) {
           return;
         }
 
@@ -306,6 +323,63 @@ async function limparReservasExpiradas() {
       );
     }
   }
+}
+
+async function garantirContadorInicializado() {
+  if (!db) {
+    throw new Error("Firestore não inicializado.");
+  }
+
+  const contadorRef =
+    db.collection("config").doc("contadorIngressos");
+
+  const contadorSnapshot = await contadorRef.get();
+
+  if (!contadorSnapshot.exists) {
+    throw new Error(
+      "Contador de ingressos não encontrado.",
+    );
+  }
+
+  const dadosContador = contadorSnapshot.data() ?? {};
+  const vendasAtivasAtual = Number(
+    dadosContador.vendasAtivas,
+  );
+
+  if (Number.isFinite(vendasAtivasAtual)) {
+    return;
+  }
+
+  const vendasSnapshot =
+    await db
+      .collection("vendas")
+      .where("cancelado", "==", false)
+      .limit(LIMITE_INGRESSOS)
+      .get();
+
+  const quantidadeAtivas = vendasSnapshot.size;
+
+  await db.runTransaction(async (transaction) => {
+    const atual = await transaction.get(contadorRef);
+
+    if (!atual.exists) {
+      throw new Error(
+        "Contador de ingressos não encontrado.",
+      );
+    }
+
+    const valorExistente = Number(
+      atual.data()?.vendasAtivas,
+    );
+
+    if (Number.isFinite(valorExistente)) {
+      return;
+    }
+
+    transaction.update(contadorRef, {
+      vendasAtivas: quantidadeAtivas,
+    });
+  });
 }
 
 async function reservarVaga(
@@ -349,8 +423,8 @@ async function reservarVaga(
       );
     }
 
-    const ultimoNumero = Number(
-      contadorSnapshot.data()?.ultimoNumero ?? 0,
+    const vendasAtivas = Number(
+      contadorSnapshot.data()?.vendasAtivas ?? 0,
     );
 
     const reservasAtivas = Number(
@@ -358,7 +432,7 @@ async function reservarVaga(
     );
 
     if (
-      !Number.isFinite(ultimoNumero) ||
+      !Number.isFinite(vendasAtivas) ||
       !Number.isFinite(reservasAtivas)
     ) {
       throw new Error(
@@ -367,7 +441,7 @@ async function reservarVaga(
     }
 
     if (
-      ultimoNumero + reservasAtivas >=
+      vendasAtivas + reservasAtivas >=
       LIMITE_INGRESSOS
     ) {
       throw new Error("INGRESSOS_ESGOTADOS");
@@ -385,6 +459,8 @@ async function reservarVaga(
       vendedorId: dados.vendedorId,
       vendedorNome: dados.vendedorNome,
       usuarioUid: dados.usuarioUid,
+      valorEsperado: 15,
+      moedaEsperada: "BRL",
       status: "aguardando",
       criadoEm: agora.toISOString(),
       atualizadoEm: agora.toISOString(),
@@ -493,6 +569,207 @@ async function marcarReservaPendente(
   });
 }
 
+async function registrarIncidentePagamento(
+  pagamentoId: string,
+  motivo: string,
+  dados: Record<string, unknown>,
+) {
+  if (!db) return;
+
+  await db
+    .collection("incidentesPagamento")
+    .doc(pagamentoId)
+    .set(
+      {
+        pagamentoId,
+        motivo,
+        ...dados,
+        atualizadoEm: new Date().toISOString(),
+      },
+      { merge: true },
+    );
+}
+
+async function marcarVendaRevertida(
+  pagamentoId: string,
+  pagamento: Record<string, unknown>,
+  status: string,
+) {
+  if (!db) {
+    throw new Error("Firestore não inicializado.");
+  }
+
+  const externalReference =
+    String(
+      pagamento.external_reference ?? "",
+    ).trim();
+
+  const statusDetail =
+    String(
+      pagamento.status_detail ?? "",
+    ).trim();
+
+  const vendaRef =
+    db.collection("vendas").doc(pagamentoId);
+
+  const contadorRef =
+    db.collection("config").doc("contadorIngressos");
+
+  const pedidoRef = externalReference
+    ? db
+      .collection("pedidosPagamento")
+      .doc(externalReference)
+    : null;
+
+  await db.runTransaction(async (transaction) => {
+    const vendaSnapshot =
+      await transaction.get(vendaRef);
+
+    const contadorSnapshot =
+      await transaction.get(contadorRef);
+
+    const pedidoSnapshot = pedidoRef
+      ? await transaction.get(pedidoRef)
+      : null;
+
+    if (!contadorSnapshot.exists) {
+      throw new Error(
+        "Contador de ingressos não encontrado.",
+      );
+    }
+
+    const vendasAtivas = Number(
+      contadorSnapshot.data()?.vendasAtivas ?? 0,
+    );
+
+    if (!Number.isFinite(vendasAtivas)) {
+      throw new Error(
+        "Contador de ingressos inválido.",
+      );
+    }
+
+    if (vendaSnapshot.exists) {
+      const venda = vendaSnapshot.data() ?? {};
+      const jaCancelada = venda.cancelado === true;
+
+      if (!jaCancelada) {
+        transaction.update(contadorRef, {
+          vendasAtivas:
+            Math.max(0, vendasAtivas - 1),
+        });
+      }
+
+      transaction.update(vendaRef, {
+        cancelado: true,
+        statusPagamento: status,
+        statusDetalhe: statusDetail,
+        estornado: status === "refunded",
+        chargeback: status === "charged_back",
+        atualizadoEm: new Date().toISOString(),
+      });
+    }
+
+    if (
+      pedidoRef &&
+      pedidoSnapshot &&
+      pedidoSnapshot.exists
+    ) {
+      transaction.update(pedidoRef, {
+        status,
+        statusPagamento: status,
+        statusDetalhe: statusDetail,
+        atualizadoEm: new Date().toISOString(),
+      });
+    }
+  });
+}
+
+async function cancelarVendaAdministrativamente(
+  uid: string,
+  pagamentoId: string,
+) {
+  if (!db) {
+    throw new Error("Firestore não inicializado.");
+  }
+
+  const perfilSnapshot =
+    await db.collection("usuarios").doc(uid).get();
+
+  if (!perfilSnapshot.exists) {
+    throw new Error("PERFIL_NAO_ENCONTRADO");
+  }
+
+  const papel =
+    String(perfilSnapshot.data()?.papel ?? "").trim();
+
+  if (papel !== "admin") {
+    throw new Error("SEM_PERMISSAO");
+  }
+
+  const vendaRef =
+    db.collection("vendas").doc(pagamentoId);
+
+  const contadorRef =
+    db.collection("config").doc("contadorIngressos");
+
+  return await db.runTransaction(
+    async (transaction) => {
+      const vendaSnapshot =
+        await transaction.get(vendaRef);
+
+      const contadorSnapshot =
+        await transaction.get(contadorRef);
+
+      if (!vendaSnapshot.exists) {
+        throw new Error("VENDA_NAO_ENCONTRADA");
+      }
+
+      if (!contadorSnapshot.exists) {
+        throw new Error(
+          "Contador de ingressos não encontrado.",
+        );
+      }
+
+      const venda = vendaSnapshot.data() ?? {};
+
+      if (venda.cancelado === true) {
+        return {
+          cancelada: false,
+          jaCancelada: true,
+        };
+      }
+
+      const vendasAtivas = Number(
+        contadorSnapshot.data()?.vendasAtivas ?? 0,
+      );
+
+      if (!Number.isFinite(vendasAtivas)) {
+        throw new Error(
+          "Contador de ingressos inválido.",
+        );
+      }
+
+      transaction.update(contadorRef, {
+        vendasAtivas:
+          Math.max(0, vendasAtivas - 1),
+      });
+
+      transaction.update(vendaRef, {
+        cancelado: true,
+        canceladaManualmente: true,
+        canceladoPorUid: uid,
+        canceladoEm: new Date().toISOString(),
+        atualizadoEm: new Date().toISOString(),
+      });
+
+      return {
+        cancelada: true,
+        jaCancelada: false,
+      };
+    },
+  );
+}
+
 async function registrarVendaAprovada(
   pagamentoId: string,
   pagamento: Record<string, unknown>,
@@ -536,6 +813,12 @@ async function registrarVendaAprovada(
     String(
       pagamento.payment_type_id ?? "",
     ).trim();
+
+  const valorPagamento =
+    Number(pagamento.transaction_amount);
+
+  const moedaPagamento =
+    String(pagamento.currency_id ?? "").trim();
 
   let pagamentoForma = "Mercado Pago";
 
@@ -595,9 +878,9 @@ async function registrarVendaAprovada(
         return {
           criada: false,
           ingresso: String(
-            vendaExistente.data()?.ingresso ??
-              pagamentoId,
+            vendaExistente.data()?.ingresso ?? "",
           ),
+          revisaoManual: false,
         };
       }
 
@@ -623,12 +906,17 @@ async function registrarVendaAprovada(
         contadorSnapshot.data()?.ultimoNumero ?? 0,
       );
 
+      const vendasAtivas = Number(
+        contadorSnapshot.data()?.vendasAtivas ?? 0,
+      );
+
       const reservasAtivas = Number(
         contadorSnapshot.data()?.reservasAtivas ?? 0,
       );
 
       if (
         !Number.isFinite(ultimoNumero) ||
+        !Number.isFinite(vendasAtivas) ||
         !Number.isFinite(reservasAtivas)
       ) {
         throw new Error(
@@ -642,14 +930,71 @@ async function registrarVendaAprovada(
         pedido.status === "aguardando" ||
         pedido.status === "pendente";
 
+      const valorEsperado =
+        Number(pedido.valorEsperado ?? 15);
+
+      const moedaEsperada =
+        String(pedido.moedaEsperada ?? "BRL");
+
+      if (
+        !Number.isFinite(valorPagamento) ||
+        valorPagamento !== valorEsperado ||
+        moedaPagamento !== moedaEsperada
+      ) {
+        transaction.update(pedidoRef, {
+          status: "approved_valor_invalido",
+          statusPagamento: "approved",
+          mercadoPagoId: pagamentoId,
+          requerRevisaoManual: true,
+          motivoRevisao: "valor_ou_moeda_invalido",
+          atualizadoEm: new Date().toISOString(),
+        });
+
+        if (reservaContabilizada) {
+          transaction.update(contadorRef, {
+            reservasAtivas:
+              Math.max(0, reservasAtivas - 1),
+          });
+        }
+
+        return {
+          criada: false,
+          ingresso: "",
+          revisaoManual: true,
+          motivo: "valor_ou_moeda_invalido",
+        };
+      }
+
+      // Se a reserva ainda está contabilizada, a vaga já estava protegida.
+      // Se ela havia expirado/liberado, somente aceitamos a aprovação tardia
+      // quando ainda há capacidade real disponível.
+      if (
+        !reservaContabilizada &&
+        vendasAtivas + reservasAtivas >=
+          LIMITE_INGRESSOS
+      ) {
+        transaction.update(pedidoRef, {
+          status: "approved_sem_vaga",
+          statusPagamento: "approved",
+          mercadoPagoId: pagamentoId,
+          requerRevisaoManual: true,
+          motivoRevisao: "aprovacao_tardia_sem_vaga",
+          pagamento: pagamentoForma,
+          paymentMethodId,
+          paymentTypeId,
+          atualizadoEm: new Date().toISOString(),
+        });
+
+        return {
+          criada: false,
+          ingresso: "",
+          revisaoManual: true,
+          motivo: "aprovacao_tardia_sem_vaga",
+        };
+      }
+
       const proximoNumero =
         ultimoNumero + 1;
-
-      if (proximoNumero > LIMITE_INGRESSOS) {
-        throw new Error(
-          "Todos os 500 ingressos já foram vendidos.",
-        );
-      }
 
       const ingresso =
         `F&A-${String(proximoNumero).padStart(
@@ -659,6 +1004,7 @@ async function registrarVendaAprovada(
 
       transaction.update(contadorRef, {
         ultimoNumero: proximoNumero,
+        vendasAtivas: vendasAtivas + 1,
         reservasAtivas: reservaContabilizada
           ? Math.max(0, reservasAtivas - 1)
           : reservasAtivas,
@@ -690,9 +1036,7 @@ async function registrarVendaAprovada(
         mercadoPagoId: pagamentoId,
         externalReference,
         statusPagamento: "approved",
-        valor: Number(
-          pagamento.transaction_amount ?? 15,
-        ),
+        valor: valorPagamento,
         comissao: 5,
         criadoEm: new Date().toISOString(),
       });
@@ -700,10 +1044,12 @@ async function registrarVendaAprovada(
       return {
         criada: true,
         ingresso,
+        revisaoManual: false,
       };
     },
   );
 }
+
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -792,6 +1138,7 @@ Deno.serve(async (req) => {
         }, 403);
       }
 
+      await garantirContadorInicializado();
       await limparReservasExpiradas();
 
       externalReference =
@@ -967,6 +1314,80 @@ Deno.serve(async (req) => {
 
   if (
     req.method === "POST" &&
+    url.pathname === "/cancelar-venda"
+  ) {
+    try {
+      const usuarioAutenticado =
+        await validarUsuarioFirebase(req);
+
+      if (!usuarioAutenticado) {
+        return json({
+          erro:
+            "Usuário não autenticado ou sessão inválida.",
+        }, 401);
+      }
+
+      await garantirContadorInicializado();
+
+      const corpo = await req.json();
+
+      const pagamentoId =
+        String(corpo.pagamentoId ?? "").trim();
+
+      if (!pagamentoId) {
+        return json({
+          erro: "Pagamento não informado.",
+        }, 400);
+      }
+
+      try {
+        const resultado =
+          await cancelarVendaAdministrativamente(
+            usuarioAutenticado.uid,
+            pagamentoId,
+          );
+
+        return json({
+          ok: true,
+          ...resultado,
+        });
+      } catch (erro) {
+        if (
+          erro instanceof Error &&
+          erro.message === "SEM_PERMISSAO"
+        ) {
+          return json({
+            erro:
+              "Você não tem permissão para cancelar vendas.",
+          }, 403);
+        }
+
+        if (
+          erro instanceof Error &&
+          erro.message === "VENDA_NAO_ENCONTRADA"
+        ) {
+          return json({
+            erro: "Venda não encontrada.",
+          }, 404);
+        }
+
+        throw erro;
+      }
+    } catch (erro) {
+      console.error(
+        "Erro em /cancelar-venda:",
+        erro,
+      );
+
+      return json({
+        erro:
+          "Erro interno ao cancelar a venda.",
+      }, 500);
+    }
+  }
+
+  if (
+    req.method === "POST" &&
     url.pathname === "/webhook"
   ) {
     try {
@@ -1090,9 +1511,12 @@ Deno.serve(async (req) => {
         });
       }
 
+      await garantirContadorInicializado();
+
       if (
         status === "rejected" ||
-        status === "cancelled"
+        status === "cancelled" ||
+        status === "expired"
       ) {
         if (externalReference) {
           await liberarReserva(
@@ -1105,6 +1529,31 @@ Deno.serve(async (req) => {
           recebido: true,
           pagamentoId,
           status,
+        });
+      }
+
+      if (
+        status === "refunded" ||
+        status === "charged_back"
+      ) {
+        if (externalReference) {
+          await liberarReserva(
+            externalReference,
+            status,
+          );
+        }
+
+        await marcarVendaRevertida(
+          pagamentoId,
+          pagamento,
+          status,
+        );
+
+        return json({
+          recebido: true,
+          pagamentoId,
+          status,
+          vendaCancelada: true,
         });
       }
 
@@ -1122,12 +1571,28 @@ Deno.serve(async (req) => {
           pagamento,
         );
 
+      if (venda.revisaoManual) {
+        await registrarIncidentePagamento(
+          pagamentoId,
+          String(venda.motivo ?? "revisao_manual"),
+          {
+            externalReference,
+            statusPagamento: status,
+            valor:
+              Number(pagamento.transaction_amount ?? 0),
+            moeda:
+              String(pagamento.currency_id ?? ""),
+          },
+        );
+      }
+
       return json({
         recebido: true,
         pagamentoId,
         status: "approved",
         vendaRegistrada: venda.criada,
         ingresso: venda.ingresso,
+        revisaoManual: venda.revisaoManual,
       });
     } catch (erro) {
       console.error(
