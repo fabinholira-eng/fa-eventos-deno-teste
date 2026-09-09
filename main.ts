@@ -66,6 +66,74 @@ async function validarUsuarioFirebase(req: Request) {
   }
 }
 
+async function obterVendedorAutorizado(
+  uid: string,
+  vendedorIdRecebido: number,
+) {
+  if (!db) {
+    throw new Error("Firestore não inicializado.");
+  }
+
+  const perfilSnapshot =
+    await db.collection("usuarios").doc(uid).get();
+
+  if (!perfilSnapshot.exists) {
+    throw new Error("Perfil do usuário não encontrado.");
+  }
+
+  const perfil = perfilSnapshot.data() ?? {};
+  const papel = String(perfil.papel ?? "").trim();
+
+  if (papel === "portaria") {
+    throw new Error("Usuário da portaria não pode criar pagamentos.");
+  }
+
+  if (papel !== "admin" && papel !== "vendedor") {
+    throw new Error("Perfil sem permissão para criar pagamentos.");
+  }
+
+  if (papel === "vendedor") {
+    const vendedorIdDoPerfil = Number(perfil.vendedorId);
+
+    if (
+      !Number.isFinite(vendedorIdDoPerfil) ||
+      vendedorIdDoPerfil !== vendedorIdRecebido
+    ) {
+      throw new Error(
+        "Vendedor não autorizado para esta operação.",
+      );
+    }
+  }
+
+  const vendedoresSnapshot =
+    await db
+      .collection("vendedores")
+      .where("id", "==", vendedorIdRecebido)
+      .limit(1)
+      .get();
+
+  if (vendedoresSnapshot.empty) {
+    throw new Error("Vendedor não encontrado.");
+  }
+
+  const vendedor = vendedoresSnapshot.docs[0].data();
+
+  if (vendedor.ativo === false) {
+    throw new Error("Vendedor inativo.");
+  }
+
+  const vendedorNome = String(vendedor.nome ?? "").trim();
+
+  if (!vendedorNome) {
+    throw new Error("Vendedor sem nome cadastrado.");
+  }
+
+  return {
+    id: vendedorIdRecebido,
+    nome: vendedorNome,
+  };
+}
+
 async function gerarHmacSha256(
   secret: string,
   mensagem: string,
@@ -329,20 +397,36 @@ Deno.serve(async (req) => {
       const vendedorId =
         Number(corpo.vendedorId);
 
-      const vendedorNome =
-        String(corpo.vendedorNome ?? "").trim();
-
       const pagamento =
         String(corpo.pagamento ?? "").trim();
 
       if (
         !comprador ||
-        !vendedorNome ||
         !Number.isFinite(vendedorId)
       ) {
         return json({
           erro: "Dados da venda incompletos.",
         }, 400);
+      }
+
+      let vendedorAutorizado;
+
+      try {
+        vendedorAutorizado =
+          await obterVendedorAutorizado(
+            usuarioAutenticado.uid,
+            vendedorId,
+          );
+      } catch (erro) {
+        console.warn(
+          "Operação de vendedor recusada:",
+          erro,
+        );
+
+        return json({
+          erro:
+            "Você não tem permissão para registrar esta venda.",
+        }, 403);
       }
 
       const externalReference = crypto.randomUUID();
@@ -391,8 +475,8 @@ Deno.serve(async (req) => {
             metadata: {
               comprador,
               telefone,
-              vendedor_id: String(vendedorId),
-              vendedor_nome: vendedorNome,
+              vendedor_id: String(vendedorAutorizado.id),
+              vendedor_nome: vendedorAutorizado.nome,
               pagamento,
               usuario_uid: usuarioAutenticado.uid,
             },
