@@ -6,6 +6,9 @@ const token = Deno.env.get("MERCADO_PAGO_ACCESS_TOKEN");
 const firebaseServiceAccount = Deno.env.get("FIREBASE_SERVICE_ACCOUNT");
 const webhookSecret = Deno.env.get("MERCADO_PAGO_WEBHOOK_SECRET");
 
+const LIMITE_INGRESSOS = 500;
+const TEMPO_RESERVA_MINUTOS = 30;
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "https://fea-eventos.web.app",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -85,11 +88,15 @@ async function obterVendedorAutorizado(
   const papel = String(perfil.papel ?? "").trim();
 
   if (papel === "portaria") {
-    throw new Error("Usuário da portaria não pode criar pagamentos.");
+    throw new Error(
+      "Usuário da portaria não pode criar pagamentos.",
+    );
   }
 
   if (papel !== "admin" && papel !== "vendedor") {
-    throw new Error("Perfil sem permissão para criar pagamentos.");
+    throw new Error(
+      "Perfil sem permissão para criar pagamentos.",
+    );
   }
 
   if (papel === "vendedor") {
@@ -122,7 +129,8 @@ async function obterVendedorAutorizado(
     throw new Error("Vendedor inativo.");
   }
 
-  const vendedorNome = String(vendedor.nome ?? "").trim();
+  const vendedorNome =
+    String(vendedor.nome ?? "").trim();
 
   if (!vendedorNome) {
     throw new Error("Vendedor sem nome cadastrado.");
@@ -176,12 +184,17 @@ function compararSeguro(a: string, b: string) {
 
 async function validarAssinaturaWebhook(req: Request) {
   if (!webhookSecret) {
-    console.error("MERCADO_PAGO_WEBHOOK_SECRET não configurado.");
+    console.error(
+      "MERCADO_PAGO_WEBHOOK_SECRET não configurado.",
+    );
     return false;
   }
 
-  const assinaturaHeader = req.headers.get("x-signature");
-  const requestId = req.headers.get("x-request-id");
+  const assinaturaHeader =
+    req.headers.get("x-signature");
+
+  const requestId =
+    req.headers.get("x-request-id");
 
   if (!assinaturaHeader || !requestId) {
     return false;
@@ -191,7 +204,8 @@ async function validarAssinaturaWebhook(req: Request) {
   let v1 = "";
 
   for (const parte of assinaturaHeader.split(",")) {
-    const [chave, valor] = parte.trim().split("=");
+    const [chave, valor] =
+      parte.trim().split("=");
 
     if (chave === "ts") ts = valor ?? "";
     if (chave === "v1") v1 = valor ?? "";
@@ -215,15 +229,268 @@ async function validarAssinaturaWebhook(req: Request) {
   const manifesto =
     `id:${dataId};request-id:${requestId};ts:${ts};`;
 
-  const assinaturaCalculada = await gerarHmacSha256(
-    webhookSecret,
-    manifesto,
-  );
+  const assinaturaCalculada =
+    await gerarHmacSha256(
+      webhookSecret,
+      manifesto,
+    );
 
   return compararSeguro(
     assinaturaCalculada.toLowerCase(),
     v1.toLowerCase(),
   );
+}
+
+async function limparReservasExpiradas() {
+  if (!db) {
+    throw new Error("Firestore não inicializado.");
+  }
+
+  const agora = new Date().toISOString();
+
+  const expiradas =
+    await db
+      .collection("pedidosPagamento")
+      .where("status", "==", "aguardando")
+      .where("expiraEm", "<=", agora)
+      .limit(50)
+      .get();
+
+  for (const documento of expiradas.docs) {
+    const pedidoRef = documento.ref;
+
+    const contadorRef =
+      db.collection("config").doc("contadorIngressos");
+
+    try {
+      await db.runTransaction(async (transaction) => {
+        const pedidoSnapshot =
+          await transaction.get(pedidoRef);
+
+        const contadorSnapshot =
+          await transaction.get(contadorRef);
+
+        if (!pedidoSnapshot.exists) return;
+
+        const pedido = pedidoSnapshot.data() ?? {};
+
+        if (pedido.status !== "aguardando") {
+          return;
+        }
+
+        if (!contadorSnapshot.exists) {
+          throw new Error(
+            "Contador de ingressos não encontrado.",
+          );
+        }
+
+        const reservasAtivas = Number(
+          contadorSnapshot.data()?.reservasAtivas ?? 0,
+        );
+
+        transaction.update(contadorRef, {
+          reservasAtivas:
+            Math.max(0, reservasAtivas - 1),
+        });
+
+        transaction.update(pedidoRef, {
+          status: "expirada",
+          atualizadoEm: new Date().toISOString(),
+        });
+      });
+    } catch (erro) {
+      console.warn(
+        "Não foi possível liberar reserva expirada:",
+        documento.id,
+        erro,
+      );
+    }
+  }
+}
+
+async function reservarVaga(
+  externalReference: string,
+  dados: {
+    comprador: string;
+    telefone: string;
+    pagamento: string;
+    vendedorId: number;
+    vendedorNome: string;
+    usuarioUid: string;
+  },
+) {
+  if (!db) {
+    throw new Error("Firestore não inicializado.");
+  }
+
+  const contadorRef =
+    db.collection("config").doc("contadorIngressos");
+
+  const pedidoRef =
+    db
+      .collection("pedidosPagamento")
+      .doc(externalReference);
+
+  const agora = new Date();
+
+  const expiracao =
+    new Date(
+      agora.getTime() +
+        TEMPO_RESERVA_MINUTOS * 60 * 1000,
+    );
+
+  await db.runTransaction(async (transaction) => {
+    const contadorSnapshot =
+      await transaction.get(contadorRef);
+
+    if (!contadorSnapshot.exists) {
+      throw new Error(
+        "Contador de ingressos não encontrado.",
+      );
+    }
+
+    const ultimoNumero = Number(
+      contadorSnapshot.data()?.ultimoNumero ?? 0,
+    );
+
+    const reservasAtivas = Number(
+      contadorSnapshot.data()?.reservasAtivas ?? 0,
+    );
+
+    if (
+      !Number.isFinite(ultimoNumero) ||
+      !Number.isFinite(reservasAtivas)
+    ) {
+      throw new Error(
+        "Contador de ingressos inválido.",
+      );
+    }
+
+    if (
+      ultimoNumero + reservasAtivas >=
+      LIMITE_INGRESSOS
+    ) {
+      throw new Error("INGRESSOS_ESGOTADOS");
+    }
+
+    transaction.update(contadorRef, {
+      reservasAtivas: reservasAtivas + 1,
+    });
+
+    transaction.set(pedidoRef, {
+      externalReference,
+      comprador: dados.comprador,
+      telefone: dados.telefone,
+      pagamento: dados.pagamento,
+      vendedorId: dados.vendedorId,
+      vendedorNome: dados.vendedorNome,
+      usuarioUid: dados.usuarioUid,
+      status: "aguardando",
+      criadoEm: agora.toISOString(),
+      atualizadoEm: agora.toISOString(),
+      expiraEm: expiracao.toISOString(),
+    });
+  });
+
+  return {
+    inicio: agora,
+    expiracao,
+  };
+}
+
+async function liberarReserva(
+  externalReference: string,
+  novoStatus: string,
+) {
+  if (!db) return;
+
+  const pedidoRef =
+    db
+      .collection("pedidosPagamento")
+      .doc(externalReference);
+
+  const contadorRef =
+    db.collection("config").doc("contadorIngressos");
+
+  await db.runTransaction(async (transaction) => {
+    const pedidoSnapshot =
+      await transaction.get(pedidoRef);
+
+    if (!pedidoSnapshot.exists) {
+      return;
+    }
+
+    const pedido = pedidoSnapshot.data() ?? {};
+
+    const reservaContabilizada =
+      pedido.status === "aguardando" ||
+      pedido.status === "pendente";
+
+    if (!reservaContabilizada) {
+      return;
+    }
+
+    const contadorSnapshot =
+      await transaction.get(contadorRef);
+
+    if (!contadorSnapshot.exists) {
+      throw new Error(
+        "Contador de ingressos não encontrado.",
+      );
+    }
+
+    const reservasAtivas = Number(
+      contadorSnapshot.data()?.reservasAtivas ?? 0,
+    );
+
+    transaction.update(contadorRef, {
+      reservasAtivas:
+        Math.max(0, reservasAtivas - 1),
+    });
+
+    transaction.update(pedidoRef, {
+      status: novoStatus,
+      atualizadoEm: new Date().toISOString(),
+    });
+  });
+}
+
+async function marcarReservaPendente(
+  externalReference: string,
+  pagamentoId: string,
+  statusPagamento: string,
+) {
+  if (!db || !externalReference) return;
+
+  const pedidoRef =
+    db
+      .collection("pedidosPagamento")
+      .doc(externalReference);
+
+  await db.runTransaction(async (transaction) => {
+    const pedidoSnapshot =
+      await transaction.get(pedidoRef);
+
+    if (!pedidoSnapshot.exists) {
+      return;
+    }
+
+    const pedido = pedidoSnapshot.data() ?? {};
+
+    if (
+      pedido.status !== "aguardando" &&
+      pedido.status !== "pendente"
+    ) {
+      return;
+    }
+
+    transaction.update(pedidoRef, {
+      status: "pendente",
+      statusPagamento,
+      mercadoPagoId: pagamentoId,
+      atualizadoEm: new Date().toISOString(),
+    });
+  });
 }
 
 async function registrarVendaAprovada(
@@ -240,19 +507,35 @@ async function registrarVendaAprovada(
       ? pagamento.metadata as Record<string, unknown>
       : {};
 
-  const comprador = String(metadata.comprador ?? "").trim();
-  const telefone = String(metadata.telefone ?? "").trim();
-  const pagamentoForma = String(metadata.pagamento ?? "").trim();
-  const vendedorNome = String(metadata.vendedor_nome ?? "").trim();
+  const comprador =
+    String(metadata.comprador ?? "").trim();
 
-  const vendedorIdTexto = String(metadata.vendedor_id ?? "").trim();
-  const vendedorId = Number(vendedorIdTexto);
+  const telefone =
+    String(metadata.telefone ?? "").trim();
+
+  const pagamentoForma =
+    String(metadata.pagamento ?? "").trim();
+
+  const vendedorNome =
+    String(metadata.vendedor_nome ?? "").trim();
+
+  const vendedorIdTexto =
+    String(metadata.vendedor_id ?? "").trim();
+
+  const vendedorId =
+    Number(vendedorIdTexto);
+
+  const externalReference =
+    String(
+      pagamento.external_reference ?? "",
+    ).trim();
 
   if (
     !comprador ||
     !vendedorNome ||
     !vendedorIdTexto ||
-    !Number.isFinite(vendedorId)
+    !Number.isFinite(vendedorId) ||
+    !externalReference
   ) {
     throw new Error(
       "Pagamento aprovado sem dados completos da venda.",
@@ -265,86 +548,129 @@ async function registrarVendaAprovada(
     throw new Error("ID de pagamento inválido.");
   }
 
-  const referenciaVenda =
+  const vendaRef =
     db.collection("vendas").doc(pagamentoId);
 
-  const referenciaContador =
+  const contadorRef =
     db.collection("config").doc("contadorIngressos");
 
-  return await db.runTransaction(async (transaction) => {
-    const vendaExistente =
-      await transaction.get(referenciaVenda);
+  const pedidoRef =
+    db
+      .collection("pedidosPagamento")
+      .doc(externalReference);
 
-    if (vendaExistente.exists) {
-      return {
-        criada: false,
-        ingresso: String(
-          vendaExistente.data()?.ingresso ?? pagamentoId,
+  return await db.runTransaction(
+    async (transaction) => {
+      const vendaExistente =
+        await transaction.get(vendaRef);
+
+      if (vendaExistente.exists) {
+        return {
+          criada: false,
+          ingresso: String(
+            vendaExistente.data()?.ingresso ??
+              pagamentoId,
+          ),
+        };
+      }
+
+      const contadorSnapshot =
+        await transaction.get(contadorRef);
+
+      const pedidoSnapshot =
+        await transaction.get(pedidoRef);
+
+      if (!contadorSnapshot.exists) {
+        throw new Error(
+          "Contador de ingressos não encontrado.",
+        );
+      }
+
+      if (!pedidoSnapshot.exists) {
+        throw new Error(
+          "Reserva do pagamento não encontrada.",
+        );
+      }
+
+      const ultimoNumero = Number(
+        contadorSnapshot.data()?.ultimoNumero ?? 0,
+      );
+
+      const reservasAtivas = Number(
+        contadorSnapshot.data()?.reservasAtivas ?? 0,
+      );
+
+      if (
+        !Number.isFinite(ultimoNumero) ||
+        !Number.isFinite(reservasAtivas)
+      ) {
+        throw new Error(
+          "Contador de ingressos inválido.",
+        );
+      }
+
+      const pedido = pedidoSnapshot.data() ?? {};
+
+      const reservaContabilizada =
+        pedido.status === "aguardando" ||
+        pedido.status === "pendente";
+
+      const proximoNumero =
+        ultimoNumero + 1;
+
+      if (proximoNumero > LIMITE_INGRESSOS) {
+        throw new Error(
+          "Todos os 500 ingressos já foram vendidos.",
+        );
+      }
+
+      const ingresso =
+        `F&A-${String(proximoNumero).padStart(
+          4,
+          "0",
+        )}`;
+
+      transaction.update(contadorRef, {
+        ultimoNumero: proximoNumero,
+        reservasAtivas: reservaContabilizada
+          ? Math.max(0, reservasAtivas - 1)
+          : reservasAtivas,
+      });
+
+      transaction.update(pedidoRef, {
+        status: "approved",
+        statusPagamento: "approved",
+        mercadoPagoId: pagamentoId,
+        ingresso,
+        atualizadoEm: new Date().toISOString(),
+      });
+
+      transaction.set(vendaRef, {
+        id,
+        comprador,
+        telefone,
+        pagamento: pagamentoForma,
+        vendedorId,
+        vendedorNome,
+        ingresso,
+        usado: false,
+        cancelado: false,
+        mercadoPagoId: pagamentoId,
+        externalReference,
+        statusPagamento: "approved",
+        valor: Number(
+          pagamento.transaction_amount ?? 15,
         ),
+        comissao: 5,
+        criadoEm: new Date().toISOString(),
+      });
+
+      return {
+        criada: true,
+        ingresso,
       };
-    }
-
-    const contadorSnapshot =
-      await transaction.get(referenciaContador);
-
-    if (!contadorSnapshot.exists) {
-      throw new Error(
-        "Contador de ingressos não encontrado.",
-      );
-    }
-
-    const ultimoNumero = Number(
-      contadorSnapshot.data()?.ultimoNumero ?? 0,
-    );
-
-    if (!Number.isFinite(ultimoNumero)) {
-      throw new Error(
-        "Contador de ingressos inválido.",
-      );
-    }
-
-    const proximoNumero = ultimoNumero + 1;
-
-    if (proximoNumero > 500) {
-      throw new Error(
-        "Todos os 500 ingressos já foram vendidos.",
-      );
-    }
-
-    const ingresso =
-      `F&A-${String(proximoNumero).padStart(4, "0")}`;
-
-    transaction.update(referenciaContador, {
-      ultimoNumero: proximoNumero,
-    });
-
-    transaction.set(referenciaVenda, {
-      id,
-      comprador,
-      telefone,
-      pagamento: pagamentoForma,
-      vendedorId,
-      vendedorNome,
-      ingresso,
-      usado: false,
-      cancelado: false,
-      mercadoPagoId: pagamentoId,
-      externalReference: String(
-        pagamento.external_reference ?? "",
-      ),
-      statusPagamento: "approved",
-      valor: Number(
-        pagamento.transaction_amount ?? 15,
-      ),
-      comissao: 5,
-      criadoEm: new Date().toISOString(),
-    });
-
-    return {
-      criada: true,
-      ingresso,
-    };
-  });
+    },
+  );
 }
 
 Deno.serve(async (req) => {
@@ -357,7 +683,10 @@ Deno.serve(async (req) => {
 
   const url = new URL(req.url);
 
-  if (req.method === "GET" && url.pathname === "/") {
+  if (
+    req.method === "GET" &&
+    url.pathname === "/"
+  ) {
     return json({
       ok: true,
       servico: "F&A Eventos API",
@@ -369,10 +698,13 @@ Deno.serve(async (req) => {
     req.method === "POST" &&
     url.pathname === "/criar-pagamento"
   ) {
+    let externalReference = "";
+
     try {
       if (!token) {
         return json({
-          erro: "Serviço de pagamento não configurado.",
+          erro:
+            "Serviço de pagamento não configurado.",
         }, 500);
       }
 
@@ -429,7 +761,46 @@ Deno.serve(async (req) => {
         }, 403);
       }
 
-      const externalReference = crypto.randomUUID();
+      // Libera reservas abandonadas antes
+      // de tentar ocupar uma nova vaga.
+      await limparReservasExpiradas();
+
+      externalReference =
+        crypto.randomUUID();
+
+      let periodoReserva;
+
+      try {
+        periodoReserva =
+          await reservarVaga(
+            externalReference,
+            {
+              comprador,
+              telefone,
+              pagamento,
+              vendedorId:
+                vendedorAutorizado.id,
+              vendedorNome:
+                vendedorAutorizado.nome,
+              usuarioUid:
+                usuarioAutenticado.uid,
+            },
+          );
+      } catch (erro) {
+        if (
+          erro instanceof Error &&
+          erro.message ===
+            "INGRESSOS_ESGOTADOS"
+        ) {
+          return json({
+            erro:
+              "Todos os 500 ingressos já foram vendidos.",
+            esgotado: true,
+          }, 409);
+        }
+
+        throw erro;
+      }
 
       const resposta = await fetch(
         "https://api.mercadopago.com/checkout/preferences",
@@ -442,10 +813,12 @@ Deno.serve(async (req) => {
           body: JSON.stringify({
             items: [
               {
-                id: "INGRESSO-HALLOWEEN-2026",
+                id:
+                  "INGRESSO-HALLOWEEN-2026",
                 title:
                   "Halloween 2026 - A Noite das Almas",
-                description: "Ingresso individual",
+                description:
+                  "Ingresso individual",
                 quantity: 1,
                 currency_id: "BRL",
                 unit_price: 15,
@@ -456,7 +829,8 @@ Deno.serve(async (req) => {
               name: comprador,
             },
 
-            external_reference: externalReference,
+            external_reference:
+              externalReference,
 
             notification_url:
               "https://fa-eventos-deno-teste.fa-producoes.deno.net/webhook",
@@ -472,13 +846,24 @@ Deno.serve(async (req) => {
 
             auto_return: "approved",
 
+            expires: true,
+
+            expiration_date_from:
+              periodoReserva.inicio.toISOString(),
+
+            expiration_date_to:
+              periodoReserva.expiracao.toISOString(),
+
             metadata: {
               comprador,
               telefone,
-              vendedor_id: String(vendedorAutorizado.id),
-              vendedor_nome: vendedorAutorizado.nome,
+              vendedor_id:
+                String(vendedorAutorizado.id),
+              vendedor_nome:
+                vendedorAutorizado.nome,
               pagamento,
-              usuario_uid: usuarioAutenticado.uid,
+              usuario_uid:
+                usuarioAutenticado.uid,
             },
           }),
         },
@@ -493,9 +878,30 @@ Deno.serve(async (req) => {
           dados,
         );
 
+        await liberarReserva(
+          externalReference,
+          "erro_criacao_pagamento",
+        );
+
         return json({
-          erro: "Não foi possível criar o pagamento.",
+          erro:
+            "Não foi possível criar o pagamento.",
         }, 502);
+      }
+
+      if (db) {
+        await db
+          .collection("pedidosPagamento")
+          .doc(externalReference)
+          .set(
+            {
+              preferenceId:
+                String(dados.id ?? ""),
+              atualizadoEm:
+                new Date().toISOString(),
+            },
+            { merge: true },
+          );
       }
 
       return json({
@@ -509,8 +915,23 @@ Deno.serve(async (req) => {
         erro,
       );
 
+      if (externalReference) {
+        try {
+          await liberarReserva(
+            externalReference,
+            "erro_interno",
+          );
+        } catch (erroLiberacao) {
+          console.error(
+            "Erro ao liberar reserva:",
+            erroLiberacao,
+          );
+        }
+      }
+
       return json({
-        erro: "Erro interno ao criar pagamento.",
+        erro:
+          "Erro interno ao criar pagamento.",
       }, 500);
     }
   }
@@ -536,7 +957,8 @@ Deno.serve(async (req) => {
 
       if (!token) {
         return json({
-          erro: "Serviço de pagamento não configurado.",
+          erro:
+            "Serviço de pagamento não configurado.",
         }, 500);
       }
 
@@ -551,7 +973,10 @@ Deno.serve(async (req) => {
       const data =
         typeof corpo.data === "object" &&
           corpo.data !== null
-          ? corpo.data as Record<string, unknown>
+          ? corpo.data as Record<
+            string,
+            unknown
+          >
           : {};
 
       const pagamentoId =
@@ -569,7 +994,8 @@ Deno.serve(async (req) => {
         `https://api.mercadopago.com/v1/payments/${pagamentoId}`,
         {
           headers: {
-            Authorization: `Bearer ${token}`,
+            Authorization:
+              `Bearer ${token}`,
           },
         },
       );
@@ -589,11 +1015,59 @@ Deno.serve(async (req) => {
       const pagamento =
         await respostaPagamento.json();
 
-      if (pagamento.status !== "approved") {
+      const status =
+        String(
+          pagamento.status ?? "",
+        ).trim();
+
+      const externalReference =
+        String(
+          pagamento.external_reference ?? "",
+        ).trim();
+
+      if (
+        status === "pending" ||
+        status === "in_process" ||
+        status === "authorized"
+      ) {
+        if (externalReference) {
+          await marcarReservaPendente(
+            externalReference,
+            pagamentoId,
+            status,
+          );
+        }
+
         return json({
           recebido: true,
           pagamentoId,
-          status: pagamento.status,
+          status,
+        });
+      }
+
+      if (
+        status === "rejected" ||
+        status === "cancelled"
+      ) {
+        if (externalReference) {
+          await liberarReserva(
+            externalReference,
+            status,
+          );
+        }
+
+        return json({
+          recebido: true,
+          pagamentoId,
+          status,
+        });
+      }
+
+      if (status !== "approved") {
+        return json({
+          recebido: true,
+          pagamentoId,
+          status,
         });
       }
 
