@@ -75,9 +75,6 @@ async function registrarVendaAprovada(
     throw new Error("Pagamento aprovado sem dados completos da venda.");
   }
 
-  // O ID do pagamento do Mercado Pago torna a operação idempotente:
-  // se o webhook for reenviado, a mesma venda será atualizada,
-  // e não será criada uma segunda venda.
   const id = Number(pagamentoId);
 
   if (!Number.isFinite(id)) {
@@ -85,42 +82,75 @@ async function registrarVendaAprovada(
   }
 
   const referenciaVenda = db.collection("vendas").doc(pagamentoId);
+  const referenciaContador = db.collection("config").doc("contadorIngressos");
 
-  const vendaExistente = await referenciaVenda.get();
+  const resultado = await db.runTransaction(async (transaction) => {
+    const vendaExistente = await transaction.get(referenciaVenda);
 
-  if (vendaExistente.exists) {
+    if (vendaExistente.exists) {
+      return {
+        criada: false,
+        ingresso: String(
+          vendaExistente.data()?.ingresso ?? pagamentoId,
+        ),
+      };
+    }
+
+    const contadorSnapshot = await transaction.get(referenciaContador);
+
+    if (!contadorSnapshot.exists) {
+      throw new Error("Contador de ingressos não encontrado.");
+    }
+
+    const ultimoNumero = Number(
+      contadorSnapshot.data()?.ultimoNumero ?? 0,
+    );
+
+    if (!Number.isFinite(ultimoNumero)) {
+      throw new Error("Contador de ingressos inválido.");
+    }
+
+    const proximoNumero = ultimoNumero + 1;
+
+    if (proximoNumero > 500) {
+      throw new Error("Todos os 500 ingressos já foram vendidos.");
+    }
+
+    const ingresso =
+      `F&A-${String(proximoNumero).padStart(4, "0")}`;
+
+    transaction.update(referenciaContador, {
+      ultimoNumero: proximoNumero,
+    });
+
+    transaction.set(referenciaVenda, {
+      id,
+      comprador,
+      telefone,
+      pagamento: pagamentoForma,
+      vendedorId,
+      vendedorNome,
+      ingresso,
+      usado: false,
+      cancelado: false,
+
+      mercadoPagoId: pagamentoId,
+      externalReference: String(
+        pagamento.external_reference ?? "",
+      ),
+      statusPagamento: "approved",
+      valor: Number(pagamento.transaction_amount ?? 15),
+      comissao: 5,
+      criadoEm: new Date().toISOString(),
+    });
+
     return {
-      criada: false,
-      ingresso: vendaExistente.data()?.ingresso ?? pagamentoId,
+      criada: true,
+      ingresso,
     };
-  }
-
-  const ingresso = `FEA-${pagamentoId}`;
-
-  await referenciaVenda.set({
-    id,
-    comprador,
-    telefone,
-    pagamento: pagamentoForma,
-    vendedorId,
-    vendedorNome,
-    ingresso,
-    usado: false,
-    cancelado: false,
-
-    // Dados adicionais de segurança e auditoria
-    mercadoPagoId: pagamentoId,
-    externalReference: String(pagamento.external_reference ?? ""),
-    statusPagamento: "approved",
-    valor: Number(pagamento.transaction_amount ?? 15),
-    comissao: 5,
-    criadoEm: new Date().toISOString(),
   });
 
-  return {
-    criada: true,
-    ingresso,
-  };
+  return resultado;
 }
 
 // -------------------------------------------------------
@@ -191,7 +221,9 @@ Deno.serve(async (req) => {
     } catch (erro) {
       return json({
         ok: false,
-        erro: erro instanceof Error ? erro.message : String(erro),
+        erro: erro instanceof Error
+          ? erro.message
+          : String(erro),
       }, 500);
     }
   }
@@ -200,7 +232,10 @@ Deno.serve(async (req) => {
   // TESTE DE PREFERÊNCIA
   // -----------------------------------------------------
 
-  if (url.pathname === "/teste-preferencia" && req.method === "GET") {
+  if (
+    url.pathname === "/teste-preferencia" &&
+    req.method === "GET"
+  ) {
     if (!token) {
       return json({
         ok: false,
@@ -252,7 +287,9 @@ Deno.serve(async (req) => {
     } catch (erro) {
       return json({
         ok: false,
-        erro: erro instanceof Error ? erro.message : String(erro),
+        erro: erro instanceof Error
+          ? erro.message
+          : String(erro),
       }, 500);
     }
   }
@@ -261,7 +298,10 @@ Deno.serve(async (req) => {
   // CRIAR PAGAMENTO
   // -----------------------------------------------------
 
-  if (url.pathname === "/criar-pagamento" && req.method === "POST") {
+  if (
+    url.pathname === "/criar-pagamento" &&
+    req.method === "POST"
+  ) {
     if (!token) {
       return json({
         ok: false,
@@ -317,6 +357,7 @@ Deno.serve(async (req) => {
 
             metadata: {
               comprador,
+
               telefone:
                 typeof body.telefone === "string"
                   ? body.telefone
@@ -356,7 +397,8 @@ Deno.serve(async (req) => {
       if (!resposta.ok) {
         return json({
           ok: false,
-          erro: "Mercado Pago recusou a criação da preferência.",
+          erro:
+            "Mercado Pago recusou a criação da preferência.",
           statusMercadoPago: resposta.status,
           detalhes: dados,
         }, 502);
@@ -372,7 +414,9 @@ Deno.serve(async (req) => {
     } catch (erro) {
       return json({
         ok: false,
-        erro: erro instanceof Error ? erro.message : String(erro),
+        erro: erro instanceof Error
+          ? erro.message
+          : String(erro),
       }, 500);
     }
   }
@@ -381,7 +425,10 @@ Deno.serve(async (req) => {
   // WEBHOOK MERCADO PAGO
   // -----------------------------------------------------
 
-  if (url.pathname === "/webhook" && req.method === "POST") {
+  if (
+    url.pathname === "/webhook" &&
+    req.method === "POST"
+  ) {
     if (!token) {
       return json({
         ok: false,
@@ -399,7 +446,8 @@ Deno.serve(async (req) => {
       }
 
       const data =
-        typeof body.data === "object" && body.data !== null
+        typeof body.data === "object" &&
+          body.data !== null
           ? body.data as Record<string, unknown>
           : {};
 
@@ -414,12 +462,11 @@ Deno.serve(async (req) => {
       if (!pagamentoId) {
         return json({
           ok: true,
-          mensagem: "Notificação recebida sem ID de pagamento.",
+          mensagem:
+            "Notificação recebida sem ID de pagamento.",
         });
       }
 
-      // Nunca confiamos apenas no conteúdo do webhook.
-      // Consultamos o pagamento diretamente no Mercado Pago.
       const respostaPagamento = await fetch(
         `https://api.mercadopago.com/v1/payments/${pagamentoId}`,
         {
@@ -439,7 +486,10 @@ Deno.serve(async (req) => {
       }
 
       const pagamento =
-        await respostaPagamento.json() as Record<string, unknown>;
+        await respostaPagamento.json() as Record<
+          string,
+          unknown
+        >;
 
       if (pagamento.status !== "approved") {
         return json({
@@ -451,11 +501,11 @@ Deno.serve(async (req) => {
         });
       }
 
-      // Somente aqui uma venda passa a existir.
-      const resultadoVenda = await registrarVendaAprovada(
-        pagamentoId,
-        pagamento,
-      );
+      const resultadoVenda =
+        await registrarVendaAprovada(
+          pagamentoId,
+          pagamento,
+        );
 
       return json({
         ok: true,
@@ -472,14 +522,11 @@ Deno.serve(async (req) => {
     } catch (erro) {
       console.error("Erro no webhook:", erro);
 
-      // Aqui devolvemos erro para que uma falha real de gravação
-      // não seja silenciosamente considerada concluída.
       return json({
         ok: false,
-        erro:
-          erro instanceof Error
-            ? erro.message
-            : String(erro),
+        erro: erro instanceof Error
+          ? erro.message
+          : String(erro),
       }, 500);
     }
   }
@@ -534,7 +581,8 @@ Deno.serve(async (req) => {
       if (!resposta.ok) {
         return json({
           ok: false,
-          erro: "Não foi possível consultar o pagamento.",
+          erro:
+            "Não foi possível consultar o pagamento.",
           statusMercadoPago: resposta.status,
         }, resposta.status === 404 ? 404 : 502);
       }
@@ -550,10 +598,9 @@ Deno.serve(async (req) => {
     } catch (erro) {
       return json({
         ok: false,
-        erro:
-          erro instanceof Error
-            ? erro.message
-            : String(erro),
+        erro: erro instanceof Error
+          ? erro.message
+          : String(erro),
       }, 500);
     }
   }
