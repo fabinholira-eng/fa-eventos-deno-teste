@@ -761,8 +761,6 @@ Deno.serve(async (req) => {
         }, 403);
       }
 
-      // Libera reservas abandonadas antes
-      // de tentar ocupar uma nova vaga.
       await limparReservasExpiradas();
 
       externalReference =
@@ -1000,6 +998,28 @@ Deno.serve(async (req) => {
         },
       );
 
+      // IDs fictícios enviados pelo simulador do Mercado Pago
+      // podem não existir na API de pagamentos.
+      // Nesse caso, reconhecemos a notificação e a ignoramos.
+      if (
+        respostaPagamento.status === 400 ||
+        respostaPagamento.status === 404
+      ) {
+        console.info(
+          "Webhook recebido para pagamento inexistente:",
+          pagamentoId,
+        );
+
+        return json({
+          recebido: true,
+          pagamentoId,
+          ignorado: true,
+          motivo: "pagamento_nao_encontrado",
+        });
+      }
+
+      // Outros erros não devem ser ignorados,
+      // pois podem indicar indisponibilidade ou problema de credencial.
       if (!respostaPagamento.ok) {
         console.error(
           "Não foi possível consultar o pagamento:",
